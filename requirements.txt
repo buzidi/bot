@@ -1,0 +1,3 @@
+telethon
+psycop2g2-binary
+rapidfuzz
