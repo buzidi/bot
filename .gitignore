@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.env
+
+# Telethon session files
+*.session
+*.session-journal
+
+# Database / Local data
+bot_data.db
+*.sqlite
+*.sqlite3
+
+# VSCode / IDE
+.vscode/
+.idea/
+.env
