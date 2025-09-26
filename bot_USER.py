@@ -1,86 +1,252 @@
+# telethon_bot.py
 import os
-import asyncio
-import random
 import re
-from telethon import TelegramClient, events
-from openai import OpenAI
+import asyncio
+import aiosqlite
+from dotenv import load_dotenv
+from telethon import TelegramClient, events, errors
+from telethon.sessions import StringSession
+from datetime import datetime, timezone
+from langdetect import detect
 
-# --- إعدادات OpenAI ---
-openai_api_key = os.environ.get("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=openai_api_key)
+load_dotenv()
 
-# --- إعدادات Telethon ---
-api_id = int(os.environ.get("API_ID"))
-api_hash = os.environ.get("API_HASH")
+API_ID = int(os.getenv("API_ID") or 0)
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or None
+SESSION_NAME = os.getenv("SESSION_NAME") or "my_session"
 
-# --- اختيار نوع الجلسة ---
-bot_token = os.environ.get("BOT_TOKEN")
-session_string = os.environ.get("SESSION_STRING")
+DB_PATH = "bot_data.db"
+MAX_QUEUE_SIZE = 10000
 
-if bot_token:
-    # استخدام بوت رسمي
-    client = TelegramClient('bot', api_id, api_hash).start(bot_token=bot_token)
-elif session_string:
-    # استخدام حساب شخصي مع Session String
-    client = TelegramClient.from_session_string(session_string, api_id, api_hash)
-    client.start()
-else:
-    raise ValueError("يرجى وضع BOT_TOKEN أو SESSION_STRING في متغيرات البيئة")
+# ---------- Arabic text utilities ----------
+_arabic_diacritics = re.compile("""
+                             ّ    | # Tashdid
+                             َ    | # Fatha
+                             ً    | # Tanwin Fath
+                             ُ    | # Damma
+                             ٌ    | # Tanwin Damm
+                             ِ    | # Kasra
+                             ٍ    | # Tanwin Kasr
+                             ْ    | # Sukun
+                             ـ     # Tatwil/Kashida
+                         """, re.VERBOSE)
 
-# --- ذاكرة المحادثة لكل مستخدم ---
-conversations = {}
+def normalize_arabic(text: str) -> str:
+    text = text.strip()
+    text = _arabic_diacritics.sub('', text)
+    # normalize alef variants
+    text = re.sub("[إأآا]", "ا", text)
+    text = re.sub("ى", "ي", text)
+    text = re.sub("ئ", "ء", text)
+    text = re.sub("ؤ", "ء", text)
+    text = re.sub("ـ", "", text)
+    text = re.sub(r"[^\w\sء-ي]", " ", text)  # remove punctuation (keep arabic letters)
+    text = re.sub(r"\s+", " ", text)
+    return text.lower()
 
-async def get_chatgpt_reply(user_id: int, user_text: str) -> str:
-    """إرسال النص إلى ChatGPT مع حفظ السياق"""
-    if user_id not in conversations:
-        conversations[user_id] = [
-            {"role": "system", "content": "انت بوت ودود ومساعد في الدردشة."}
+# ---------- Simple Intent/FAQ engine (قابل للتوسيع) ----------
+INTENTS = {
+    "opening_hours": {
+        "keywords": ["متى", "الدوام", "مواعيد", "متى تفتح", "متى يفتح"],
+        "responses": [
+            "دوام المعهد: من الأحد إلى الخميس، من الساعة 8 صباحًا حتى 2 ظهرًا. هل تريد مواعيد مكتب التسجيل؟",
+            "مواعيدنا عادة تكون صباحية - هل تريد تفاصيل أكثر عن دورات بعينها؟"
         ]
-    conversations[user_id].append({"role": "user", "content": user_text})
+    },
+    "courses": {
+        "keywords": ["دورة", "دورات", "مادة", "منهاج", "مقررات"],
+        "responses": [
+            "نقدم دورات في الفقه، التفسير، الحديث، وأصول الدين. هل تبحث عن مستوى معين (تمهيدي / متوسط / متقدم)؟",
+            "هل تود معلومات عن المدة أو الشهادة أو المنهاج؟"
+        ]
+    },
+    "registration": {
+        "keywords": ["تسجيل", "سجل", "الالتحاق", "التسجيل"],
+        "responses": [
+            "للتسجيل الرجاء إرسال اسمك الكامل، رقم الهاتف، والبرنامج الذي ترغب به. سيتابعك موظف التسجيل بإذن الله.",
+            "يمكن التسجيل عبر النموذج الإلكتروني أو الحضور لمكتب التسجيل في المواعيد أعلاه. تود الرابط؟"
+        ]
+    },
+    "religious_question": {
+        "keywords": ["حكم", "سؤال شرعي", "مشروعي", "كيف أفعل", "هل يجوز", "ما حكم"],
+        "responses": [
+            "بالنسبة للسؤال الشرعي: نعتمد على الأدلة الشرعية والفقهية. هل تستطيع تزويدي بتفصيل السؤال؟",
+            "نرحب بالأسئلة الشرعية. سأحاول الإجابة باختصار، وإذا احتاج الأمر لتفصيل فسنحيلك لأحد المختصين."
+        ]
+    },
+    "greeting": {
+        "keywords": ["السلام", "مرحبا", "أهلا", "السلام عليكم", "وعليكم السلام"],
+        "responses": [
+            "وعليكم السلام ورحمة الله وبركاته — كيف أستطيع مساعدتك اليوم؟",
+            "أهلاً وسهلاً بك في معهدنا، تفضل بسؤالك أو ما الذي تود معرفته؟"
+        ]
+    },
+    "thanks": {
+        "keywords": ["شكرا", "شكراً", "جزاك", "بارك الله فيك"],
+        "responses": [
+            "العفو، في خدمتك دائماً. هل تحتاج إلى شيء آخر؟",
+            "بارك الله فيك، أسأل الله أن يبارك في علمك."
+        ]
+    },
+}
 
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=conversations[user_id],
-            max_tokens=200,
-            temperature=0.7
-        )
-        reply = response.choices[0].message.content
-        conversations[user_id].append({"role": "assistant", "content": reply})
+FALLBACK_RESPONSES = [
+    "جزاك الله خيراً على التواصل. لم أفهم سؤالك تماماً، هل يمكنك كتابته بصيغة أخرى أو إضافة تفاصيل؟",
+    "أعتذر، لم أتمكن من تحديد ما تريد. هل تبحث عن مواعيد، دورات، أو سؤال شرعي محدد؟"
+]
 
-        # إزالة أقدم الرسائل إذا تجاوزت 15 رسالة لتقليل الذاكرة
-        if len(conversations[user_id]) > 15:
-            conversations[user_id] = [conversations[user_id][0]] + conversations[user_id][-14:]
+# ---------- Database helpers (SQLite) ----------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS contexts (
+                user_id INTEGER PRIMARY KEY,
+                last_update TEXT,
+                context TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                incoming TEXT,
+                outgoing TEXT,
+                ts TEXT
+            )
+        """)
+        await db.commit()
 
-        return reply
-    except Exception as e:
-        return f"حصل خطأ: {e}"
+async def save_context(user_id: int, context_text: str):
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO contexts (user_id, last_update, context) VALUES (?, ?, ?)",
+                         (user_id, now, context_text))
+        await db.commit()
 
-def is_spam(text: str) -> bool:
-    """تجاهل الرسائل القصيرة جدًا أو التي تحتوي على روابط"""
-    if len(text.strip()) < 3:
-        return True
-    if re.search(r"(http[s]?://|t\.me/|www\.)", text.lower()):
-        return True
-    return False
+async def get_context(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT context FROM contexts WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else ""
 
-# --- مستمع للرسائل الخاصة ---
-@client.on(events.NewMessage(incoming=True))
-async def handler(event):
-    if event.is_private:
-        user_id = event.sender_id
-        text = event.raw_text
+async def log_message(user_id: int, incoming: str, outgoing: str):
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO logs (user_id, incoming, outgoing, ts) VALUES (?, ?, ?, ?)",
+                         (user_id, incoming, outgoing, now))
+        await db.commit()
 
-        if is_spam(text):
+# ---------- Intent detection ----------
+def detect_intent(text: str):
+    """Simple keyword-based intent detection (Arabic). Returns (intent, score)."""
+    text_norm = normalize_arabic(text)
+    best = (None, 0)
+    for intent, info in INTENTS.items():
+        score = 0
+        for kw in info["keywords"]:
+            kw_norm = normalize_arabic(kw)
+            if kw_norm in text_norm:
+                score += 2
+            # word-by-word match
+            for token in text_norm.split():
+                if token == kw_norm:
+                    score += 1
+        # small boost if language seems Arabic
+        try:
+            lang = detect(text)
+            if lang == "ar":
+                score += 0.5
+        except Exception:
+            pass
+        if score > best[1]:
+            best = (intent, score)
+    return best
+
+def generate_response_for_intent(intent: str, user_message: str, context: str) -> str:
+    if not intent:
+        return FALLBACK_RESPONSES[0]
+    candidates = INTENTS[intent]["responses"]
+    # simple selection: choose first candidate; could be randomized or context-aware
+    resp = candidates[0]
+    # personalize tiny bit
+    if "سؤال شرعي" in user_message or intent == "religious_question":
+        resp += " (ملاحظة: هذه إجابة عامة، وللحكم النهائي يرجى الرجوع إلى أحد العلماء أو مكتب الفتوى بالمعهد.)"
+    return resp
+
+# ---------- Bot / Client setup ----------
+async def start_client():
+    await init_db()
+
+    # If BOT_TOKEN present, start as bot (simpler for استضافة)
+    if BOT_TOKEN:
+        client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+        print("Started as bot (via BOT_TOKEN).")
+    else:
+        client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+        # If no session file exists, this will prompt (once) for phone & code when running interactively.
+        await client.start()
+        print("Started as user-client (session stored).")
+
+    # message queue (simple backpressure)
+    queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+
+    @client.on(events.NewMessage(incoming=True))
+    async def handler(event):
+        # avoid acting on channels/bots if desired; here we process private messages only
+        if not event.is_private:
+            return
+        sender = await event.get_sender()
+        user_id = sender.id
+        text = event.raw_text or ""
+        # push to queue for background processing
+        try:
+            queue.put_nowait((event, user_id, text))
+        except asyncio.QueueFull:
+            await event.reply("عذراً، عدد الرسائل كبير الآن. حاول لاحقاً. بارك الله فيك.")
             return
 
-        reply = await get_chatgpt_reply(user_id, text)
+    async def worker():
+        while True:
+            event, user_id, text = await queue.get()
+            try:
+                await process_message(client, event, user_id, text)
+            except Exception as e:
+                print("Error processing message:", e)
+            queue.task_done()
 
-        # تأخير عشوائي لتقليل احتمالية الحظر
-        await asyncio.sleep(random.randint(2, 6))
+    # spawn workers
+    workers = [asyncio.create_task(worker()) for _ in range(4)]  # 4 workers — قابل للزيادة
+    print("Workers started.")
+    await client.run_until_disconnected()
+    for w in workers:
+        w.cancel()
 
-        await event.reply(reply)
+async def process_message(client: TelegramClient, event, user_id: int, text: str):
+    # get context
+    ctx = await get_context(user_id) or ""
+    intent, score = detect_intent(text)
+    # generate response
+    resp = generate_response_for_intent(intent, text, ctx)
+    # optionally, include short context-aware personalization
+    if ctx:
+        resp = resp + "\n\n" + "معلومة سابقة محفوظة لدينا: " + (ctx[:120] + "..." if len(ctx) > 120 else ctx)
+    # update context (simple policy: keep last user message)
+    new_ctx = text if len(text) < 1000 else text[:1000]
+    await save_context(user_id, new_ctx)
+    # log
+    await log_message(user_id, text, resp)
+    # send reply
+    try:
+        await event.reply(resp)
+    except errors.BotMethodInvalidError:
+        # fallback if reply not allowed
+        await client.send_message(user_id, resp)
 
-# --- تشغيل البوت ---
-print("🚀 Bot is running...")
-client.run_until_disconnected()
+# ---------- Entrypoint ----------
+if __name__ == "__main__":
+    try:
+        asyncio.run(start_client())
+    except KeyboardInterrupt:
+        print("Exiting...")
